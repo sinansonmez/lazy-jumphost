@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,10 +38,14 @@ type ConnectionState struct {
 	TunnelCmd   *exec.Cmd
 	LastError   string
 	LastUpdated time.Time
+	Logf        LogFunc
 }
+
+type LogFunc func(format string, args ...any)
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML config")
+	debugMode := flag.Bool("debug", false, "Show debug logs in the UI")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -66,6 +71,35 @@ func main() {
 	statusBar := tview.NewTextView()
 	statusBar.SetDynamicColors(true)
 	statusBar.SetBorder(true).SetTitle("Messages")
+
+	var logView *tview.TextView
+	var debugLogf LogFunc
+	if *debugMode {
+		logView = tview.NewTextView()
+		logView.SetDynamicColors(true)
+		logView.SetBorder(true).SetTitle("Debug Logs")
+		logView.SetChangedFunc(func() {
+			app.Draw()
+		})
+		logCh := make(chan string, 200)
+		debugLogf = func(format string, args ...any) {
+			message := fmt.Sprintf(format, args...)
+			logCh <- message
+		}
+		go func() {
+			for message := range logCh {
+				app.QueueUpdateDraw(func() {
+					fmt.Fprintln(logView, message)
+				})
+			}
+		}()
+		debugLogf("debug mode enabled")
+		debugLogf("log writer ready")
+	}
+
+	for _, state := range states {
+		state.Logf = debugLogf
+	}
 
 	for _, state := range states {
 		list.AddItem(state.Config.Name, "", 0, nil)
@@ -158,6 +192,9 @@ func main() {
 	layout.AddItem(mainRow, 0, 1, true)
 	layout.AddItem(buttons, 3, 0, false)
 	layout.AddItem(statusBar, 3, 0, false)
+	if logView != nil {
+		layout.AddItem(logView, 8, 0, false)
+	}
 
 	refresh()
 
@@ -243,7 +280,8 @@ func (state *ConnectionState) Start() error {
 		return errors.New("connection already running")
 	}
 
-	if err := runCloudSQLAccess(state.Config); err != nil {
+	state.logf("starting connection %s", state.Config.Name)
+	if err := runCloudSQLAccess(state.Config, state.logf); err != nil {
 		state.LastError = err.Error()
 		return err
 	}
@@ -253,8 +291,15 @@ func (state *ConnectionState) Start() error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stderr
+	if state.Logf != nil {
+		logWriter := &logChannelWriter{logf: state.Logf, prefix: fmt.Sprintf("[%s] ", state.Config.Name)}
+		cmd.Stderr = io.MultiWriter(&stderr, logWriter)
+		cmd.Stdout = io.MultiWriter(&stderr, logWriter)
+		state.logf("ssh command: ssh -N -T -L %s %s", localSpec, state.remoteHost())
+	}
 	if err := cmd.Start(); err != nil {
 		state.LastError = err.Error()
+		state.logf("failed to start ssh: %v", err)
 		return err
 	}
 
@@ -266,6 +311,9 @@ func (state *ConnectionState) Start() error {
 		err := cmd.Wait()
 		if err != nil {
 			state.LastError = err.Error()
+			state.logf("ssh exited with error: %v", err)
+		} else {
+			state.logf("ssh exited successfully")
 		}
 		state.TunnelCmd = nil
 		state.LastUpdated = time.Now()
@@ -279,6 +327,7 @@ func (state *ConnectionState) Stop() error {
 		return nil
 	}
 
+	state.logf("stopping connection %s", state.Config.Name)
 	cmd := state.TunnelCmd
 	if cmd == nil || cmd.Process == nil {
 		state.TunnelCmd = nil
@@ -287,6 +336,7 @@ func (state *ConnectionState) Stop() error {
 
 	if err := sendTerminate(cmd.Process); err != nil {
 		state.LastError = err.Error()
+		state.logf("failed to terminate ssh: %v", err)
 		return err
 	}
 
@@ -302,6 +352,7 @@ func (state *ConnectionState) Stop() error {
 
 	if err := cmd.Process.Kill(); err != nil {
 		state.LastError = err.Error()
+		state.logf("failed to kill ssh: %v", err)
 		return err
 	}
 
@@ -337,13 +388,19 @@ func (state *ConnectionState) remoteSocketPath() string {
 	return fmt.Sprintf("/home/%s/%s/.s.PGSQL.5432", state.Config.User, state.Config.CloudSQLInstance)
 }
 
-func runCloudSQLAccess(cfg ConnectionConfig) error {
+func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc) error {
 	cmd := exec.Command("ssh", fmt.Sprintf("%s@%s", cfg.User, cfg.Host), fmt.Sprintf("cloudsql_access.sh start %s", cfg.CloudSQLInstance))
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Run(); err != nil {
+		if logf != nil {
+			logf("cloudsql_access failed: %s", strings.TrimSpace(output.String()))
+		}
 		return fmt.Errorf("cloudsql_access failed: %s", strings.TrimSpace(output.String()))
+	}
+	if logf != nil {
+		logf("cloudsql_access ok: %s", strings.TrimSpace(output.String()))
 	}
 	return nil
 }
@@ -360,4 +417,43 @@ func sendTerminate(process *os.Process) error {
 		return process.Signal(os.Interrupt)
 	}
 	return process.Signal(syscall.SIGTERM)
+}
+
+func (state *ConnectionState) logf(format string, args ...any) {
+	if state.Logf == nil {
+		return
+	}
+	state.Logf(format, args...)
+}
+
+type logChannelWriter struct {
+	ch     chan<- string
+	logf   LogFunc
+	prefix string
+}
+
+func (writer *logChannelWriter) Write(p []byte) (int, error) {
+	if writer.logf != nil {
+		lines := strings.Split(string(p), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			writer.logf("%s%s", writer.prefix, line)
+		}
+		return len(p), nil
+	}
+	if writer.ch == nil {
+		return len(p), nil
+	}
+	lines := strings.Split(string(p), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		writer.ch <- fmt.Sprintf("%s%s", writer.prefix, line)
+	}
+	return len(p), nil
 }
