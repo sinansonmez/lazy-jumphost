@@ -1,0 +1,11 @@
+connections:
+  - name: db-abc-de-prd
+    user: user123
+    host: jumphost.prd.g4c.company.eu
+    cloudsql_instance: ucs-abc-prd-002:europe-west4:sql-abc-prd-pgsql001
+    local_port: 5432
+  - name: db-akk-de-uat
+    user: user123
+    host: jumphost.uat.g4c.company.eu
+    cloudsql_instance: ucs-abc-uat-002:europe-west4:sql-abc-uat-pgsql001
+    local_port: 6432
