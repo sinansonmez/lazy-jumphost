@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -280,7 +281,7 @@ func (state *ConnectionState) Stop() error {
 		return nil
 	}
 
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := sendTerminate(cmd.Process); err != nil {
 		state.LastError = err.Error()
 		return err
 	}
@@ -308,6 +309,12 @@ func (state *ConnectionState) Stop() error {
 func (state *ConnectionState) IsRunning() bool {
 	if state.TunnelCmd == nil || state.TunnelCmd.Process == nil {
 		return false
+	}
+	if runtime.GOOS == "windows" {
+		if state.TunnelCmd.ProcessState == nil {
+			return true
+		}
+		return !state.TunnelCmd.ProcessState.Exited()
 	}
 	if err := state.TunnelCmd.Process.Signal(syscall.Signal(0)); err != nil {
 		return false
@@ -339,4 +346,14 @@ func runCloudSQLAccess(cfg ConnectionConfig) error {
 
 func escapeColons(value string) string {
 	return strings.ReplaceAll(value, ":", "\\:")
+}
+
+func sendTerminate(process *os.Process) error {
+	if process == nil {
+		return errors.New("process not started")
+	}
+	if runtime.GOOS == "windows" {
+		return process.Signal(os.Interrupt)
+	}
+	return process.Signal(syscall.SIGTERM)
 }
