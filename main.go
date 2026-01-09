@@ -162,7 +162,11 @@ func main() {
 	refresh()
 
 	quitSignals := make(chan os.Signal, 1)
-	signal.Notify(quitSignals, os.Interrupt, syscall.SIGTERM)
+	if runtime.GOOS == "windows" {
+		signal.Notify(quitSignals, os.Interrupt)
+	} else {
+		signal.Notify(quitSignals, os.Interrupt, syscall.SIGTERM)
+	}
 	go func() {
 		<-quitSignals
 		app.QueueUpdateDraw(func() {
