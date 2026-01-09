@@ -285,22 +285,19 @@ func (state *ConnectionState) Stop() error {
 		return err
 	}
 
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !state.IsRunning() {
+			state.TunnelCmd = nil
+			state.LastUpdated = time.Now()
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	select {
-	case err := <-waitCh:
-		if err != nil {
-			state.LastError = err.Error()
-			return err
-		}
-	case <-time.After(2 * time.Second):
-		if err := cmd.Process.Kill(); err != nil {
-			state.LastError = err.Error()
-			return err
-		}
+	if err := cmd.Process.Kill(); err != nil {
+		state.LastError = err.Error()
+		return err
 	}
 
 	state.TunnelCmd = nil
