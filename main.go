@@ -128,7 +128,6 @@ func main() {
 	})
 
 	startSelected := func() {
-		debugLogf("list")
 		index := list.GetCurrentItem()
 		if index < 0 || index >= len(states) {
 			return
@@ -206,6 +205,9 @@ func main() {
 	refresh()
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if prompter != nil && prompter.IsActive() {
+			return event
+		}
 		switch event.Rune() {
 		case 's':
 			go startSelected()
@@ -517,6 +519,15 @@ type PasswordPrompter struct {
 
 func NewPasswordPrompter(app *tview.Application, pages *tview.Pages) *PasswordPrompter {
 	return &PasswordPrompter{app: app, pages: pages}
+}
+
+func (prompter *PasswordPrompter) IsActive() bool {
+	if prompter == nil {
+		return false
+	}
+	prompter.mu.Lock()
+	defer prompter.mu.Unlock()
+	return prompter.active
 }
 
 func (prompter *PasswordPrompter) Prompt(prompt string) (string, bool) {
