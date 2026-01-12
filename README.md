@@ -30,6 +30,7 @@ Each connection requires:
 
 ```bash
 go run . -config config.yaml
+./dist/darwin/arm64/lazy-jumphost -config config.yaml -debug
 ```
 
 Use the Start/Stop buttons to manage tunnels and Refresh to update status.
