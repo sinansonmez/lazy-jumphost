@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -87,7 +88,7 @@ func main() {
 		logView.SetBorder(true).SetTitle("Debug Logs")
 		logCh := make(chan string, 200)
 		debugLogf = func(format string, args ...any) {
-			message := fmt.Sprintf(format, args...)
+			message := stripANSICodes(fmt.Sprintf(format, args...))
 			logCh <- message
 		}
 		go func() {
@@ -307,17 +308,19 @@ func (state *ConnectionState) Start() error {
 		return errors.New("connection already running")
 	}
 
-	password := ""
+	passwordCache := NewPasswordCache("")
 	if state.Prompter != nil {
 		entered, ok := state.Prompter.PromptOptional("SSH password (leave blank to use keys)")
 		if !ok {
 			return errors.New("start cancelled")
 		}
-		password = entered
+		if entered != "" {
+			passwordCache.Set(entered)
+		}
 	}
 
 	state.logf("starting connection %s", state.Config.Name)
-	if err := runCloudSQLAccess(state.Config, state.logf, state.Prompter, password); err != nil {
+	if err := runCloudSQLAccess(state.Config, state.logf, state.Prompter, NewPasswordResponder(passwordCache)); err != nil {
 		state.LastError = err.Error()
 		return err
 	}
@@ -336,9 +339,8 @@ func (state *ConnectionState) Start() error {
 	state.LastError = ""
 	state.LastUpdated = time.Now()
 	state.logf("ssh command: ssh -N -T -L %s %s", localSpec, state.remoteHost())
-	writePassword(ptyFile, password)
 
-	go monitorPTYOutput(ptyFile, state.Logf, state.Prompter, ptyFile)
+	go monitorPTYOutput(ptyFile, state.Logf, state.Prompter, ptyFile, NewPasswordResponder(passwordCache))
 
 	go func() {
 		err := cmd.Wait()
@@ -429,7 +431,7 @@ func (state *ConnectionState) remoteSocketPath() string {
 	return fmt.Sprintf("/home/%s/%s/.s.PGSQL.5432", state.Config.User, state.Config.CloudSQLInstance)
 }
 
-func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc, prompter *PasswordPrompter, password string) error {
+func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc, prompter *PasswordPrompter, responder *PasswordResponder) error {
 	cmd := exec.Command("ssh", fmt.Sprintf("%s@%s", cfg.User, cfg.Host), fmt.Sprintf("cloudsql_access.sh start %s", cfg.CloudSQLInstance))
 	ptyFile, err := pty.Start(cmd)
 	if err != nil {
@@ -444,8 +446,7 @@ func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc, prompter *PasswordPro
 		done <- cmd.Wait()
 	}()
 
-	writePassword(ptyFile, password)
-	go monitorPTYOutput(ptyFile, logf, prompter, ptyFile)
+	go monitorPTYOutput(ptyFile, logf, prompter, ptyFile, responder)
 	err = <-done
 	_ = ptyFile.Close()
 	if err != nil {
@@ -508,6 +509,75 @@ func (writer *logChannelWriter) Write(p []byte) (int, error) {
 		writer.ch <- fmt.Sprintf("%s%s", writer.prefix, line)
 	}
 	return len(p), nil
+}
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func stripANSICodes(message string) string {
+	if message == "" {
+		return message
+	}
+	return ansiEscapePattern.ReplaceAllString(message, "")
+}
+
+type PasswordCache struct {
+	mu    sync.Mutex
+	value string
+}
+
+func NewPasswordCache(initial string) *PasswordCache {
+	return &PasswordCache{value: initial}
+}
+
+func (cache *PasswordCache) Get() string {
+	if cache == nil {
+		return ""
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	return cache.value
+}
+
+func (cache *PasswordCache) Set(value string) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	cache.value = value
+	cache.mu.Unlock()
+}
+
+type PasswordResponder struct {
+	cache *PasswordCache
+	used  bool
+}
+
+func NewPasswordResponder(cache *PasswordCache) *PasswordResponder {
+	return &PasswordResponder{cache: cache}
+}
+
+func (responder *PasswordResponder) Next(prompter *PasswordPrompter, prompt string) (string, bool) {
+	if responder == nil {
+		return "", false
+	}
+	if !responder.used {
+		if cached := responder.cache.Get(); cached != "" {
+			responder.used = true
+			return cached, true
+		}
+	}
+	if prompter == nil {
+		return "", false
+	}
+	password, ok := prompter.Prompt(prompt)
+	if !ok {
+		return "", false
+	}
+	responder.used = true
+	if password != "" {
+		responder.cache.Set(password)
+	}
+	return password, true
 }
 
 type PasswordPrompter struct {
@@ -661,7 +731,7 @@ func centerPrimitive(primitive tview.Primitive, width int, height int) tview.Pri
 	return col
 }
 
-func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter, writer io.Writer) {
+func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter, writer io.Writer, responder *PasswordResponder) {
 	buf := make([]byte, 4096)
 	var pending strings.Builder
 	for {
@@ -680,15 +750,25 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 			pending.WriteString(chunk)
 			needle := strings.ToLower(pending.String())
 			if strings.Contains(needle, "password:") {
-				if prompter == nil {
-					pending.Reset()
-					continue
+				responded := false
+				if responder != nil {
+					password, ok := responder.Next(prompter, "SSH password")
+					if ok {
+						if password != "" {
+							_, _ = writer.Write([]byte(password + "\n"))
+						} else {
+							_, _ = writer.Write([]byte("\n"))
+						}
+						responded = true
+					}
 				}
-				password, ok := prompter.Prompt("SSH password")
-				if ok && password != "" {
-					_, _ = writer.Write([]byte(password + "\n"))
-				} else if ok {
-					_, _ = writer.Write([]byte("\n"))
+				if !responded && prompter != nil {
+					password, ok := prompter.Prompt("SSH password")
+					if ok && password != "" {
+						_, _ = writer.Write([]byte(password + "\n"))
+					} else if ok {
+						_, _ = writer.Write([]byte("\n"))
+					}
 				}
 				pending.Reset()
 			}
@@ -700,11 +780,4 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 			return
 		}
 	}
-}
-
-func writePassword(writer io.Writer, password string) {
-	if writer == nil || password == "" {
-		return
-	}
-	_, _ = writer.Write([]byte(password + "\n"))
 }
