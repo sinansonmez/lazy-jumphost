@@ -85,9 +85,6 @@ func main() {
 		logView = tview.NewTextView()
 		logView.SetDynamicColors(true)
 		logView.SetBorder(true).SetTitle("Debug Logs")
-		logView.SetChangedFunc(func() {
-			app.Draw()
-		})
 		logCh := make(chan string, 200)
 		debugLogf = func(format string, args ...any) {
 			message := fmt.Sprintf(format, args...)
@@ -97,6 +94,7 @@ func main() {
 			for message := range logCh {
 				app.QueueUpdateDraw(func() {
 					fmt.Fprintln(logView, message)
+					logView.ScrollToEnd()
 				})
 			}
 		}()
@@ -210,16 +208,16 @@ func main() {
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Rune() {
 		case 's':
-			startSelected()
+			go startSelected()
 			return nil
 		case 'x':
-			stopSelected()
+			go stopSelected()
 			return nil
 		case 'r':
-			refreshSelected()
+			go app.QueueUpdateDraw(refreshSelected)
 			return nil
 		case 'q':
-			quitSelected()
+			go app.QueueUpdateDraw(quitSelected)
 			return nil
 		}
 		return event
