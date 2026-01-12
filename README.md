@@ -34,4 +34,9 @@ go run . -config config.yaml
 
 Use the Start/Stop buttons to manage tunnels and Refresh to update status.
 
-Use `-debug` to show a debug log panel inside the UI.
+Use `-debug` to show a debug log panel inside the UI. ANSI color codes from
+remote commands are stripped in the debug output.
+
+Password prompts appear once per connection start and are reused for the
+Cloud SQL access step and the SSH tunnel. If the password is incorrect, you'll
+be prompted again when the remote asks.
