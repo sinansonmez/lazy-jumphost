@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,9 +11,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	"gopkg.in/yaml.v3"
@@ -36,9 +37,11 @@ type ConnectionConfig struct {
 type ConnectionState struct {
 	Config      ConnectionConfig
 	TunnelCmd   *exec.Cmd
+	TunnelPTY   *os.File
 	LastError   string
 	LastUpdated time.Time
 	Logf        LogFunc
+	Prompter    *PasswordPrompter
 }
 
 type LogFunc func(format string, args ...any)
@@ -71,6 +74,10 @@ func main() {
 	statusBar := tview.NewTextView()
 	statusBar.SetDynamicColors(true)
 	statusBar.SetBorder(true).SetTitle("Messages")
+
+	helpBar := tview.NewTextView()
+	helpBar.SetBorder(true).SetTitle("Keys")
+	helpBar.SetText("s=start  x=stop  r=refresh  q=quit")
 
 	var logView *tview.TextView
 	var debugLogf LogFunc
@@ -122,7 +129,8 @@ func main() {
 		updateDetails(details, index, states)
 	})
 
-	startButton := tview.NewButton("Start").SetSelectedFunc(func() {
+	startSelected := func() {
+		debugLogf("list")
 		index := list.GetCurrentItem()
 		if index < 0 || index >= len(states) {
 			return
@@ -142,9 +150,9 @@ func main() {
 				refresh()
 			})
 		}()
-	})
+	}
 
-	stopButton := tview.NewButton("Stop").SetSelectedFunc(func() {
+	stopSelected := func() {
 		index := list.GetCurrentItem()
 		if index < 0 || index >= len(states) {
 			return
@@ -164,25 +172,19 @@ func main() {
 				refresh()
 			})
 		}()
-	})
+	}
 
-	refreshButton := tview.NewButton("Refresh").SetSelectedFunc(func() {
+	refreshSelected := func() {
 		refresh()
 		statusBar.SetText("Status refreshed")
-	})
+	}
 
-	quitButton := tview.NewButton("Quit").SetSelectedFunc(func() {
+	quitSelected := func() {
 		for _, state := range states {
 			_ = state.Stop()
 		}
 		app.Stop()
-	})
-
-	buttons := tview.NewFlex().SetDirection(tview.FlexColumn)
-	buttons.AddItem(startButton, 12, 1, false)
-	buttons.AddItem(stopButton, 12, 1, false)
-	buttons.AddItem(refreshButton, 12, 1, false)
-	buttons.AddItem(quitButton, 12, 1, false)
+	}
 
 	layout := tview.NewFlex().SetDirection(tview.FlexRow)
 	mainRow := tview.NewFlex().SetDirection(tview.FlexColumn)
@@ -190,13 +192,38 @@ func main() {
 	mainRow.AddItem(details, 0, 2, false)
 
 	layout.AddItem(mainRow, 0, 1, true)
-	layout.AddItem(buttons, 3, 0, false)
 	layout.AddItem(statusBar, 3, 0, false)
+	layout.AddItem(helpBar, 3, 0, false)
 	if logView != nil {
 		layout.AddItem(logView, 8, 0, false)
 	}
 
+	pages := tview.NewPages()
+	pages.AddPage("main", layout, true, true)
+	prompter := NewPasswordPrompter(app, pages)
+	for _, state := range states {
+		state.Prompter = prompter
+	}
+
 	refresh()
+
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Rune() {
+		case 's':
+			startSelected()
+			return nil
+		case 'x':
+			stopSelected()
+			return nil
+		case 'r':
+			refreshSelected()
+			return nil
+		case 'q':
+			quitSelected()
+			return nil
+		}
+		return event
+	})
 
 	quitSignals := make(chan os.Signal, 1)
 	if runtime.GOOS == "windows" {
@@ -222,7 +249,7 @@ func main() {
 		}
 	}()
 
-	if err := app.SetRoot(layout, true).EnableMouse(true).Run(); err != nil {
+	if err := app.SetRoot(pages, true).EnableMouse(true).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run app: %v\n", err)
 		os.Exit(1)
 	}
@@ -280,32 +307,38 @@ func (state *ConnectionState) Start() error {
 		return errors.New("connection already running")
 	}
 
+	password := ""
+	if state.Prompter != nil {
+		entered, ok := state.Prompter.PromptOptional("SSH password (leave blank to use keys)")
+		if !ok {
+			return errors.New("start cancelled")
+		}
+		password = entered
+	}
+
 	state.logf("starting connection %s", state.Config.Name)
-	if err := runCloudSQLAccess(state.Config, state.logf); err != nil {
+	if err := runCloudSQLAccess(state.Config, state.logf, state.Prompter, password); err != nil {
 		state.LastError = err.Error()
 		return err
 	}
 
 	localSpec := fmt.Sprintf("127.0.0.1:%d:%s", state.Config.LocalPort, escapeColons(state.remoteSocketPath()))
 	cmd := exec.Command("ssh", "-N", "-T", "-L", localSpec, state.remoteHost())
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Stdout = &stderr
-	if state.Logf != nil {
-		logWriter := &logChannelWriter{logf: state.Logf, prefix: fmt.Sprintf("[%s] ", state.Config.Name)}
-		cmd.Stderr = io.MultiWriter(&stderr, logWriter)
-		cmd.Stdout = io.MultiWriter(&stderr, logWriter)
-		state.logf("ssh command: ssh -N -T -L %s %s", localSpec, state.remoteHost())
-	}
-	if err := cmd.Start(); err != nil {
+	ptyFile, err := pty.Start(cmd)
+	if err != nil {
 		state.LastError = err.Error()
 		state.logf("failed to start ssh: %v", err)
 		return err
 	}
 
 	state.TunnelCmd = cmd
+	state.TunnelPTY = ptyFile
 	state.LastError = ""
 	state.LastUpdated = time.Now()
+	state.logf("ssh command: ssh -N -T -L %s %s", localSpec, state.remoteHost())
+	writePassword(ptyFile, password)
+
+	go monitorPTYOutput(ptyFile, state.Logf, state.Prompter, ptyFile)
 
 	go func() {
 		err := cmd.Wait()
@@ -316,6 +349,10 @@ func (state *ConnectionState) Start() error {
 			state.logf("ssh exited successfully")
 		}
 		state.TunnelCmd = nil
+		if state.TunnelPTY != nil {
+			_ = state.TunnelPTY.Close()
+			state.TunnelPTY = nil
+		}
 		state.LastUpdated = time.Now()
 	}()
 
@@ -356,6 +393,10 @@ func (state *ConnectionState) Stop() error {
 		return err
 	}
 
+	if state.TunnelPTY != nil {
+		_ = state.TunnelPTY.Close()
+		state.TunnelPTY = nil
+	}
 	state.TunnelCmd = nil
 	state.LastUpdated = time.Now()
 	return nil
@@ -388,19 +429,30 @@ func (state *ConnectionState) remoteSocketPath() string {
 	return fmt.Sprintf("/home/%s/%s/.s.PGSQL.5432", state.Config.User, state.Config.CloudSQLInstance)
 }
 
-func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc) error {
+func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc, prompter *PasswordPrompter, password string) error {
 	cmd := exec.Command("ssh", fmt.Sprintf("%s@%s", cfg.User, cfg.Host), fmt.Sprintf("cloudsql_access.sh start %s", cfg.CloudSQLInstance))
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	if err := cmd.Run(); err != nil {
-		if logf != nil {
-			logf("cloudsql_access failed: %s", strings.TrimSpace(output.String()))
-		}
-		return fmt.Errorf("cloudsql_access failed: %s", strings.TrimSpace(output.String()))
+	ptyFile, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("cloudsql_access failed: %w", err)
+	}
+	defer func() {
+		_ = ptyFile.Close()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	writePassword(ptyFile, password)
+	go monitorPTYOutput(ptyFile, logf, prompter, ptyFile)
+	err = <-done
+	_ = ptyFile.Close()
+	if err != nil {
+		return fmt.Errorf("cloudsql_access failed: %v", err)
 	}
 	if logf != nil {
-		logf("cloudsql_access ok: %s", strings.TrimSpace(output.String()))
+		logf("cloudsql_access ok")
 	}
 	return nil
 }
@@ -456,4 +508,194 @@ func (writer *logChannelWriter) Write(p []byte) (int, error) {
 		writer.ch <- fmt.Sprintf("%s%s", writer.prefix, line)
 	}
 	return len(p), nil
+}
+
+type PasswordPrompter struct {
+	app    *tview.Application
+	pages  *tview.Pages
+	mu     sync.Mutex
+	active bool
+}
+
+func NewPasswordPrompter(app *tview.Application, pages *tview.Pages) *PasswordPrompter {
+	return &PasswordPrompter{app: app, pages: pages}
+}
+
+func (prompter *PasswordPrompter) Prompt(prompt string) (string, bool) {
+	if prompter == nil {
+		return "", false
+	}
+	prompter.mu.Lock()
+	if prompter.active {
+		prompter.mu.Unlock()
+		return "", false
+	}
+	prompter.active = true
+	prompter.mu.Unlock()
+
+	resultCh := make(chan string, 1)
+	cancelCh := make(chan struct{}, 1)
+
+	prompter.app.QueueUpdateDraw(func() {
+		previous := prompter.app.GetFocus()
+		input := tview.NewInputField()
+		input.SetLabel("Password")
+		input.SetMaskCharacter('*')
+
+		form := tview.NewForm()
+		form.SetBorder(true).SetTitle(prompt)
+		form.AddFormItem(input)
+		form.AddButton("Submit", func() {
+			prompter.pages.RemovePage("password")
+			if previous != nil {
+				prompter.app.SetFocus(previous)
+			}
+			resultCh <- input.GetText()
+		})
+		form.AddButton("Cancel", func() {
+			prompter.pages.RemovePage("password")
+			if previous != nil {
+				prompter.app.SetFocus(previous)
+			}
+			cancelCh <- struct{}{}
+		})
+
+		modal := centerPrimitive(form, 60, 9)
+		prompter.pages.AddPage("password", modal, true, true)
+		prompter.app.SetFocus(input)
+	})
+
+	var password string
+	var ok bool
+	select {
+	case password = <-resultCh:
+		ok = true
+	case <-cancelCh:
+		ok = false
+	}
+
+	prompter.mu.Lock()
+	prompter.active = false
+	prompter.mu.Unlock()
+	return password, ok
+}
+
+func (prompter *PasswordPrompter) PromptOptional(prompt string) (string, bool) {
+	if prompter == nil {
+		return "", true
+	}
+	prompter.mu.Lock()
+	if prompter.active {
+		prompter.mu.Unlock()
+		return "", true
+	}
+	prompter.active = true
+	prompter.mu.Unlock()
+
+	resultCh := make(chan string, 1)
+	cancelCh := make(chan struct{}, 1)
+
+	prompter.app.QueueUpdateDraw(func() {
+		previous := prompter.app.GetFocus()
+		input := tview.NewInputField()
+		input.SetLabel("Password")
+		input.SetMaskCharacter('*')
+
+		form := tview.NewForm()
+		form.SetBorder(true).SetTitle(prompt)
+		form.AddFormItem(input)
+		form.AddButton("Continue", func() {
+			prompter.pages.RemovePage("password")
+			if previous != nil {
+				prompter.app.SetFocus(previous)
+			}
+			resultCh <- input.GetText()
+		})
+		form.AddButton("Cancel", func() {
+			prompter.pages.RemovePage("password")
+			if previous != nil {
+				prompter.app.SetFocus(previous)
+			}
+			cancelCh <- struct{}{}
+		})
+
+		modal := centerPrimitive(form, 60, 9)
+		prompter.pages.AddPage("password", modal, true, true)
+		prompter.app.SetFocus(input)
+	})
+
+	var password string
+	var ok bool
+	select {
+	case password = <-resultCh:
+		ok = true
+	case <-cancelCh:
+		ok = false
+	}
+
+	prompter.mu.Lock()
+	prompter.active = false
+	prompter.mu.Unlock()
+	return password, ok
+}
+
+func centerPrimitive(primitive tview.Primitive, width int, height int) tview.Primitive {
+	row := tview.NewFlex().SetDirection(tview.FlexRow)
+	row.AddItem(nil, 0, 1, false)
+	row.AddItem(primitive, height, 1, true)
+	row.AddItem(nil, 0, 1, false)
+
+	col := tview.NewFlex().SetDirection(tview.FlexColumn)
+	col.AddItem(nil, 0, 1, false)
+	col.AddItem(row, width, 1, true)
+	col.AddItem(nil, 0, 1, false)
+	return col
+}
+
+func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter, writer io.Writer) {
+	buf := make([]byte, 4096)
+	var pending strings.Builder
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			chunk := string(buf[:n])
+			if logf != nil {
+				for _, line := range strings.Split(chunk, "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					logf("%s", line)
+				}
+			}
+			pending.WriteString(chunk)
+			needle := strings.ToLower(pending.String())
+			if strings.Contains(needle, "password:") {
+				if prompter == nil {
+					pending.Reset()
+					continue
+				}
+				password, ok := prompter.Prompt("SSH password")
+				if ok && password != "" {
+					_, _ = writer.Write([]byte(password + "\n"))
+				} else if ok {
+					_, _ = writer.Write([]byte("\n"))
+				}
+				pending.Reset()
+			}
+			if pending.Len() > 4096 {
+				pending.Reset()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func writePassword(writer io.Writer, password string) {
+	if writer == nil || password == "" {
+		return
+	}
+	_, _ = writer.Write([]byte(password + "\n"))
 }
