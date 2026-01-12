@@ -33,3 +33,5 @@ go run . -config config.yaml
 ```
 
 Use the Start/Stop buttons to manage tunnels and Refresh to update status.
+
+Use `-debug` to show a debug log panel inside the UI.
