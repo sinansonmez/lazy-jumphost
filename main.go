@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +40,7 @@ type ConnectionState struct {
 	Config      ConnectionConfig
 	TunnelCmd   *exec.Cmd
 	TunnelPTY   *os.File
+	TunnelIO    *commandIO
 	LastError   string
 	LastUpdated time.Time
 	Logf        LogFunc
@@ -47,9 +49,20 @@ type ConnectionState struct {
 
 type LogFunc func(format string, args ...any)
 
+const (
+	cloudSQLAccessProgressInterval = 5 * time.Second
+	cloudSQLAccessTimeout          = 90 * time.Second
+)
+
 func main() {
+	if os.Getenv("LAZY_JUMPHOST_ASKPASS") == "1" {
+		fmt.Print(os.Getenv("LAZY_JUMPHOST_ASKPASS_PASSWORD"))
+		return
+	}
+
 	configPath := flag.String("config", "config.yaml", "Path to YAML config")
 	debugMode := flag.Bool("debug", false, "Show debug logs in the UI")
+	logFilePath := flag.String("log-file", "lazy-jumphost-debug.txt", "Path to debug log file; set empty to disable file logging")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -82,10 +95,26 @@ func main() {
 
 	var logView *tview.TextView
 	var debugLogf LogFunc
+	var debugLogFile *os.File
+	if *debugMode || *logFilePath != "" {
+		var err error
+		if *logFilePath != "" {
+			debugLogFile, err = os.OpenFile(*logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open debug log file: %v\n", err)
+				os.Exit(1)
+			}
+			defer func() {
+				_ = debugLogFile.Close()
+			}()
+		}
+	}
 	if *debugMode {
 		logView = tview.NewTextView()
 		logView.SetDynamicColors(true)
 		logView.SetBorder(true).SetTitle("Debug Logs")
+	}
+	if *debugMode || debugLogFile != nil {
 		logCh := make(chan string, 200)
 		debugLogf = func(format string, args ...any) {
 			message := stripANSICodes(fmt.Sprintf(format, args...))
@@ -93,13 +122,26 @@ func main() {
 		}
 		go func() {
 			for message := range logCh {
-				app.QueueUpdateDraw(func() {
-					fmt.Fprintln(logView, message)
-					logView.ScrollToEnd()
-				})
+				if debugLogFile != nil {
+					timestamp := time.Now().Format(time.RFC3339)
+					_, _ = fmt.Fprintf(debugLogFile, "%s %s\n", timestamp, message)
+				}
+				if logView != nil {
+					app.QueueUpdateDraw(func() {
+						fmt.Fprintln(logView, message)
+						logView.ScrollToEnd()
+					})
+				}
 			}
 		}()
-		debugLogf("debug mode enabled")
+		if *debugMode {
+			debugLogf("debug mode enabled")
+		} else {
+			debugLogf("file logging enabled")
+		}
+		if debugLogFile != nil {
+			debugLogf("debug log file: %s", *logFilePath)
+		}
 		debugLogf("log writer ready")
 	}
 
@@ -307,6 +349,12 @@ func (state *ConnectionState) Start() error {
 	if state.IsRunning() {
 		return errors.New("connection already running")
 	}
+	if err := ensureLocalPortAvailable(state.Config.LocalPort); err != nil {
+		state.LastError = err.Error()
+		state.LastUpdated = time.Now()
+		state.logf("local port check failed: %v", err)
+		return err
+	}
 
 	passwordCache := NewPasswordCache("")
 	if state.Prompter != nil {
@@ -318,32 +366,52 @@ func (state *ConnectionState) Start() error {
 			passwordCache.Set(entered)
 		}
 	}
-
-	state.logf("starting connection %s", state.Config.Name)
-	if err := runCloudSQLAccess(state.Config, state.logf, state.Prompter, NewPasswordResponder(passwordCache)); err != nil {
-		state.LastError = err.Error()
-		return err
+	if passwordCache.Get() != "" {
+		state.logf("ssh password provided for non-interactive auth")
+	} else {
+		state.logf("no ssh password provided; relying on ssh keys or agent")
 	}
 
+	state.LastError = ""
+	state.LastUpdated = time.Now()
+	state.logf("starting connection %s on %s/%s", state.Config.Name, runtime.GOOS, runtime.GOARCH)
+	state.logf("cloudsql_access starting for %s via %s", state.Config.CloudSQLInstance, state.remoteHost())
+	if err := runCloudSQLAccess(state.Config, state.logf, state.Prompter, NewPasswordResponder(passwordCache)); err != nil {
+		state.LastError = err.Error()
+		state.logf("cloudsql_access failed for %s: %v", state.Config.Name, err)
+		return err
+	}
+	state.logf("cloudsql_access completed for %s", state.Config.Name)
+
 	localSpec := fmt.Sprintf("127.0.0.1:%d:%s", state.Config.LocalPort, escapeColons(state.remoteSocketPath()))
-	cmd := exec.Command("ssh", "-N", "-T", "-L", localSpec, state.remoteHost())
-	ptyFile, err := pty.Start(cmd)
+	cmd := exec.Command("ssh", append(sshArgs(), "-N", "-T", "-L", localSpec, state.remoteHost())...)
+	state.logf("ssh tunnel starting: ssh -N -T -L %s %s", localSpec, state.remoteHost())
+	askpassCleanup, err := configureSSHAskpass(cmd, "ssh tunnel", passwordCache.Get(), state.logf)
 	if err != nil {
+		state.LastError = err.Error()
+		state.logf("failed to configure ssh askpass: %v", err)
+		return err
+	}
+	cmdIO, err := startCommandIO("ssh tunnel", cmd, state.logf)
+	if err != nil {
+		askpassCleanup()
 		state.LastError = err.Error()
 		state.logf("failed to start ssh: %v", err)
 		return err
 	}
+	cmdIO.addCleanup(askpassCleanup)
 
 	state.TunnelCmd = cmd
-	state.TunnelPTY = ptyFile
+	state.TunnelPTY = cmdIO.ptyFile
+	state.TunnelIO = cmdIO
 	state.LastError = ""
 	state.LastUpdated = time.Now()
 	state.logf("ssh command: ssh -N -T -L %s %s", localSpec, state.remoteHost())
 
-	go monitorPTYOutput(ptyFile, state.Logf, state.Prompter, ptyFile, NewPasswordResponder(passwordCache))
+	go monitorPTYOutput("ssh tunnel", cmdIO.reader, state.Logf, state.Prompter, cmdIO.writer, NewPasswordResponder(passwordCache), nil)
 
 	go func() {
-		err := cmd.Wait()
+		err := cmdIO.Wait()
 		if err != nil {
 			state.LastError = err.Error()
 			state.logf("ssh exited with error: %v", err)
@@ -351,10 +419,9 @@ func (state *ConnectionState) Start() error {
 			state.logf("ssh exited successfully")
 		}
 		state.TunnelCmd = nil
-		if state.TunnelPTY != nil {
-			_ = state.TunnelPTY.Close()
-			state.TunnelPTY = nil
-		}
+		cmdIO.Close()
+		state.TunnelPTY = nil
+		state.TunnelIO = nil
 		state.LastUpdated = time.Now()
 	}()
 
@@ -399,6 +466,10 @@ func (state *ConnectionState) Stop() error {
 		_ = state.TunnelPTY.Close()
 		state.TunnelPTY = nil
 	}
+	if state.TunnelIO != nil {
+		state.TunnelIO.Close()
+		state.TunnelIO = nil
+	}
 	state.TunnelCmd = nil
 	state.LastUpdated = time.Now()
 	return nil
@@ -432,34 +503,270 @@ func (state *ConnectionState) remoteSocketPath() string {
 }
 
 func runCloudSQLAccess(cfg ConnectionConfig, logf LogFunc, prompter *PasswordPrompter, responder *PasswordResponder) error {
-	cmd := exec.Command("ssh", fmt.Sprintf("%s@%s", cfg.User, cfg.Host), fmt.Sprintf("cloudsql_access.sh start %s", cfg.CloudSQLInstance))
-	ptyFile, err := pty.Start(cmd)
+	cmd := exec.Command("ssh", append(sshArgs(), fmt.Sprintf("%s@%s", cfg.User, cfg.Host), fmt.Sprintf("cloudsql_access.sh start %s", cfg.CloudSQLInstance))...)
+	if logf != nil {
+		logf("cloudsql_access command: %s", commandDebugString(cmd))
+	}
+	askpassCleanup, err := configureSSHAskpass(cmd, "cloudsql_access", cachedResponderPassword(responder), logf)
 	if err != nil {
 		return fmt.Errorf("cloudsql_access failed: %w", err)
 	}
-	defer func() {
-		_ = ptyFile.Close()
-	}()
+	cmdIO, err := startCommandIO("cloudsql_access", cmd, logf)
+	if err != nil {
+		askpassCleanup()
+		return fmt.Errorf("cloudsql_access failed: %w", err)
+	}
+	cmdIO.addCleanup(askpassCleanup)
+	defer cmdIO.Close()
 
 	done := make(chan error, 1)
+	ready := make(chan struct{}, 1)
 	go func() {
-		done <- cmd.Wait()
+		if logf != nil {
+			logf("cloudsql_access waiting for command to finish")
+		}
+		done <- cmdIO.Wait()
 	}()
 
-	go monitorPTYOutput(ptyFile, logf, prompter, ptyFile, responder)
-	err = <-done
-	_ = ptyFile.Close()
-	if err != nil {
-		return fmt.Errorf("cloudsql_access failed: %v", err)
+	go monitorPTYOutput("cloudsql_access", cmdIO.reader, logf, prompter, cmdIO.writer, responder, ready)
+	ticker := time.NewTicker(cloudSQLAccessProgressInterval)
+	defer ticker.Stop()
+	timeout := time.NewTimer(cloudSQLAccessTimeout)
+	defer timeout.Stop()
+	startedAt := time.Now()
+	for {
+		select {
+		case err = <-done:
+			cmdIO.Close()
+			if err != nil {
+				return fmt.Errorf("cloudsql_access failed: %v", err)
+			}
+			if logf != nil {
+				logf("cloudsql_access finished after %s", time.Since(startedAt).Round(time.Second))
+			}
+			return nil
+		case <-ready:
+			if logf != nil {
+				logf("cloudsql_access printed local tunnel command after %s; continuing with app-managed tunnel", time.Since(startedAt).Round(time.Second))
+			}
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			cmdIO.Close()
+			return nil
+		case <-ticker.C:
+			if logf != nil {
+				logf("cloudsql_access still running after %s with no completion", time.Since(startedAt).Round(time.Second))
+				if runtime.GOOS == "windows" {
+					logf("cloudsql_access on windows is using pipes; if ssh is waiting for terminal auth, configure SSH keys/agent or it may not prompt inside the UI")
+				}
+			}
+		case <-timeout.C:
+			if logf != nil {
+				logf("cloudsql_access timed out after %s; terminating ssh pid=%d", time.Since(startedAt).Round(time.Second), processID(cmd))
+			}
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			cmdIO.Close()
+			return fmt.Errorf("cloudsql_access timed out after %s", cloudSQLAccessTimeout)
+		}
+	}
+}
+
+type commandIO struct {
+	reader       io.Reader
+	writer       io.Writer
+	ptyFile      *os.File
+	cmd          *exec.Cmd
+	stdinReader  *io.PipeReader
+	stdinWriter  *io.PipeWriter
+	outputReader *io.PipeReader
+	outputWriter *io.PipeWriter
+	cleanups     []func()
+	closeOnce    sync.Once
+	waitOnce     sync.Once
+	waitErr      error
+}
+
+func startCommandIO(label string, cmd *exec.Cmd, logf LogFunc) (*commandIO, error) {
+	if logf != nil {
+		logf("%s: starting with pty", label)
+	}
+	ptyFile, err := pty.Start(cmd)
+	if err == nil {
+		if logf != nil && cmd.Process != nil {
+			logf("%s: started with pty pid=%d", label, cmd.Process.Pid)
+		}
+		return &commandIO{
+			reader:  ptyFile,
+			writer:  ptyFile,
+			ptyFile: ptyFile,
+			cmd:     cmd,
+		}, nil
+	}
+	if !errors.Is(err, pty.ErrUnsupported) {
+		if logf != nil {
+			logf("%s: pty start failed: %v", label, err)
+		}
+		return nil, err
 	}
 	if logf != nil {
-		logf("cloudsql_access ok")
+		logf("%s: pty unsupported; starting with pipes", label)
 	}
-	return nil
+	return startCommandWithPipes(label, cmd, logf)
+}
+
+func startCommandWithPipes(label string, cmd *exec.Cmd, logf LogFunc) (*commandIO, error) {
+	stdinReader, stdinWriter := io.Pipe()
+	outputReader, outputWriter := io.Pipe()
+	cmd.Stdin = stdinReader
+	cmd.Stdout = outputWriter
+	cmd.Stderr = outputWriter
+
+	if err := cmd.Start(); err != nil {
+		_ = stdinReader.Close()
+		_ = stdinWriter.Close()
+		_ = outputReader.Close()
+		_ = outputWriter.Close()
+		if logf != nil {
+			logf("%s: pipe start failed: %v", label, err)
+		}
+		return nil, err
+	}
+	if logf != nil && cmd.Process != nil {
+		logf("%s: started with pipes pid=%d", label, cmd.Process.Pid)
+	}
+
+	return &commandIO{
+		reader:       outputReader,
+		writer:       stdinWriter,
+		cmd:          cmd,
+		stdinReader:  stdinReader,
+		stdinWriter:  stdinWriter,
+		outputReader: outputReader,
+		outputWriter: outputWriter,
+	}, nil
+}
+
+func configureSSHAskpass(cmd *exec.Cmd, label string, password string, logf LogFunc) (func(), error) {
+	if runtime.GOOS != "windows" || password == "" {
+		return func() {}, nil
+	}
+
+	executablePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve executable for SSH_ASKPASS: %w", err)
+	}
+
+	env := os.Environ()
+	env = append(env,
+		"SSH_ASKPASS="+executablePath,
+		"SSH_ASKPASS_REQUIRE=force",
+		"DISPLAY=lazy-jumphost",
+		"LAZY_JUMPHOST_ASKPASS=1",
+		"LAZY_JUMPHOST_ASKPASS_PASSWORD="+password,
+	)
+	cmd.Env = env
+	if logf != nil {
+		logf("%s: configured SSH_ASKPASS for windows password auth", label)
+	}
+	return func() {
+	}, nil
+}
+
+func sshArgs() []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	return []string{
+		"-o", "BatchMode=no",
+		"-o", "NumberOfPasswordPrompts=1",
+		"-o", "StrictHostKeyChecking=accept-new",
+	}
+}
+
+func cachedResponderPassword(responder *PasswordResponder) string {
+	if responder == nil || responder.cache == nil {
+		return ""
+	}
+	return responder.cache.Get()
+}
+
+func commandDebugString(cmd *exec.Cmd) string {
+	if cmd == nil {
+		return ""
+	}
+	return strings.Join(cmd.Args, " ")
+}
+
+func processID(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+	return cmd.Process.Pid
+}
+
+func (cmdIO *commandIO) addCleanup(cleanup func()) {
+	if cmdIO == nil || cleanup == nil {
+		return
+	}
+	cmdIO.cleanups = append(cmdIO.cleanups, cleanup)
+}
+
+func (cmdIO *commandIO) Wait() error {
+	if cmdIO == nil || cmdIO.cmd == nil {
+		return errors.New("process not started")
+	}
+	cmdIO.waitOnce.Do(func() {
+		cmdIO.waitErr = cmdIO.cmd.Wait()
+		if cmdIO.outputWriter != nil {
+			_ = cmdIO.outputWriter.Close()
+		}
+		if cmdIO.stdinReader != nil {
+			_ = cmdIO.stdinReader.Close()
+		}
+	})
+	return cmdIO.waitErr
+}
+
+func (cmdIO *commandIO) Close() {
+	if cmdIO == nil {
+		return
+	}
+	cmdIO.closeOnce.Do(func() {
+		if cmdIO.ptyFile != nil {
+			_ = cmdIO.ptyFile.Close()
+		}
+		if cmdIO.stdinWriter != nil {
+			_ = cmdIO.stdinWriter.Close()
+		}
+		if cmdIO.stdinReader != nil {
+			_ = cmdIO.stdinReader.Close()
+		}
+		if cmdIO.outputReader != nil {
+			_ = cmdIO.outputReader.Close()
+		}
+		if cmdIO.outputWriter != nil {
+			_ = cmdIO.outputWriter.Close()
+		}
+		for _, cleanup := range cmdIO.cleanups {
+			cleanup()
+		}
+	})
 }
 
 func escapeColons(value string) string {
 	return strings.ReplaceAll(value, ":", "\\:")
+}
+
+func ensureLocalPortAvailable(port int) error {
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("local port %d is already in use or unavailable: %w", port, err)
+	}
+	return listener.Close()
 }
 
 func sendTerminate(process *os.Process) error {
@@ -467,7 +774,7 @@ func sendTerminate(process *os.Process) error {
 		return errors.New("process not started")
 	}
 	if runtime.GOOS == "windows" {
-		return process.Signal(os.Interrupt)
+		return process.Kill()
 	}
 	return process.Signal(syscall.SIGTERM)
 }
@@ -731,9 +1038,13 @@ func centerPrimitive(primitive tview.Primitive, width int, height int) tview.Pri
 	return col
 }
 
-func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter, writer io.Writer, responder *PasswordResponder) {
+func monitorPTYOutput(label string, reader io.Reader, logf LogFunc, prompter *PasswordPrompter, writer io.Writer, responder *PasswordResponder, ready chan<- struct{}) {
+	if logf != nil {
+		logf("%s: output monitor started", label)
+	}
 	buf := make([]byte, 4096)
 	var pending strings.Builder
+	readySent := false
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
@@ -748,8 +1059,23 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 				}
 			}
 			pending.WriteString(chunk)
-			needle := strings.ToLower(pending.String())
-			if strings.Contains(needle, "password:") {
+			pendingText := pending.String()
+			if !readySent && cloudSQLAccessReady(pendingText) {
+				if logf != nil {
+					logf("%s: local tunnel command detected", label)
+				}
+				if ready != nil {
+					select {
+					case ready <- struct{}{}:
+					default:
+					}
+				}
+				readySent = true
+			}
+			if sshPasswordPromptDetected(pendingText) {
+				if logf != nil {
+					logf("%s: password prompt detected", label)
+				}
 				responded := false
 				if responder != nil {
 					password, ok := responder.Next(prompter, "SSH password")
@@ -760,6 +1086,9 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 							_, _ = writer.Write([]byte("\n"))
 						}
 						responded = true
+						if logf != nil {
+							logf("%s: responded to password prompt", label)
+						}
 					}
 				}
 				if !responded && prompter != nil {
@@ -769,6 +1098,12 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 					} else if ok {
 						_, _ = writer.Write([]byte("\n"))
 					}
+					if logf != nil && ok {
+						logf("%s: prompted for password and wrote response", label)
+					}
+				}
+				if !responded && prompter == nil && logf != nil {
+					logf("%s: password prompt detected but no prompter was available", label)
 				}
 				pending.Reset()
 			}
@@ -777,7 +1112,34 @@ func monitorPTYOutput(reader io.Reader, logf LogFunc, prompter *PasswordPrompter
 			}
 		}
 		if err != nil {
+			if logf != nil {
+				if errors.Is(err, io.EOF) {
+					logf("%s: output monitor closed", label)
+				} else {
+					logf("%s: output monitor stopped: %v", label, err)
+				}
+			}
 			return
 		}
 	}
+}
+
+func cloudSQLAccessReady(output string) bool {
+	return strings.Contains(output, "ssh -fnNT -L")
+}
+
+func sshPasswordPromptDetected(output string) bool {
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		normalized := strings.TrimSpace(stripANSICodes(line))
+		lower := strings.ToLower(normalized)
+		if !strings.HasSuffix(lower, "password:") {
+			continue
+		}
+		if strings.HasPrefix(lower, "password:") {
+			continue
+		}
+		return true
+	}
+	return false
 }
